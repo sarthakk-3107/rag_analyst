@@ -1,26 +1,12 @@
 """
-Financial Filings RAG Analyst Assistant - Main Application
-FE524 Project - Phase 1
+Financial RAG Analyst - AI-powered Q&A for SEC 10-K filings
 
-Dependencies (using uv):
-uv venv
-.venv\\Scripts\\activate  # Windows
-uv pip install -r requirements.txt
+Setup:
+    uv venv && .venv\\Scripts\\activate && uv pip install -r requirements.txt
+    Create .env with: OPENAI_API_KEY=your-key-here
+    Run: streamlit run financial_rag.py
 
-Or create a virtual environment:
-uv venv
-.venv\\Scripts\\activate  (Windows) or source .venv/bin/activate (Mac/Linux)
-uv pip install -r requirements.txt
-
-API key setup:
-Your OpenAI API key must have access to:
-- gpt-5-mini (for LLM)
-- text-embedding-3-small (for embeddings)
-
-Create a .env file in this directory with:
-OPENAI_API_KEY=your-key-here
-
-Then run: streamlit run financial_rag.py
+Required API access: gpt-5-mini, text-embedding-3-small
 """
 
 import os
@@ -56,8 +42,413 @@ class DocumentChunk:
     metadata: Dict[str, Any]
     embedding: np.ndarray = None
 
+
+# ============== SPECIALIZED AGENTS ==============
+
+class FinancialAnalystAgent:
+    """Specialized agent for financial analysis and calculations"""
+    
+    def __init__(self, client):
+        self.client = client
+        self.name = "Financial Analyst"
+        self.system_prompt = """You are a financial analyst expert. Your role is to:
+- Extract and analyze financial metrics (revenue, profit, expenses)
+- Calculate financial ratios (P/E, debt-to-equity, operating margin)
+- Identify trends and patterns in financial data
+- Provide quantitative insights with calculations shown"""
+    
+    def get_tools(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "extract_metric",
+                    "description": "Extract a specific financial metric from the document context",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "metric_name": {"type": "string", "description": "Name of metric (revenue, net_income, operating_expenses, etc.)"},
+                            "value": {"type": "number", "description": "The extracted numeric value"},
+                            "unit": {"type": "string", "description": "Unit (millions, billions, percentage)"},
+                            "source": {"type": "string", "description": "Where this was found in the document"}
+                        },
+                        "required": ["metric_name", "value"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculate_ratio",
+                    "description": "Calculate a financial ratio",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "ratio_name": {"type": "string", "description": "Name of the ratio"},
+                            "formula": {"type": "string", "description": "Formula used"},
+                            "numerator": {"type": "number"},
+                            "denominator": {"type": "number"},
+                            "result": {"type": "number"}
+                        },
+                        "required": ["ratio_name", "result"]
+                    }
+                }
+            }
+        ]
+    
+    def analyze(self, question: str, context: str) -> Dict:
+        """Perform financial analysis"""
+        prompt = f"""Analyze the following financial data to answer the question.
+
+Context from SEC 10-K filing:
+{context}
+
+Question: {question}
+
+Extract relevant metrics, perform calculations, and provide a detailed financial analysis.
+Use the tools to extract metrics and calculate ratios where appropriate."""
+
+        response = self.client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            tools=self.get_tools(),
+            tool_choice="auto"
+        )
+        
+        return self._process_response(response, question, context)
+    
+    def _process_response(self, response, question: str, context: str) -> Dict:
+        """Process agent response and tool calls"""
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+        
+        extracted_data = []
+        calculations = []
+        
+        for tool_call in tool_calls:
+            try:
+                args = json.loads(tool_call.function.arguments)
+                if tool_call.function.name == "extract_metric":
+                    extracted_data.append(args)
+                elif tool_call.function.name == "calculate_ratio":
+                    calculations.append(args)
+            except:
+                pass
+        
+        # Generate final analysis
+        final_prompt = f"""Based on your analysis:
+Question: {question}
+Extracted Data: {json.dumps(extracted_data)}
+Calculations: {json.dumps(calculations)}
+
+Provide a clear, professional answer with citations."""
+
+        final_response = self.client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": final_prompt}
+            ]
+        )
+        
+        return {
+            "answer": final_response.choices[0].message.content,
+            "extracted_data": extracted_data,
+            "calculations": calculations,
+            "agent": self.name
+        }
+
+
+class ComplianceAgent:
+    """Specialized agent for compliance checking"""
+    
+    def __init__(self, client):
+        self.client = client
+        self.name = "Compliance Officer"
+        self.system_prompt = """You are a compliance officer expert. Your role is to:
+- Check SEC regulatory compliance
+- Verify disclosure requirements are met
+- Identify missing or incomplete information
+- Flag potential compliance issues"""
+    
+    def get_tools(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "check_disclosure",
+                    "description": "Check if a required disclosure is present",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "disclosure_type": {"type": "string"},
+                            "is_present": {"type": "boolean"},
+                            "completeness": {"type": "string", "enum": ["complete", "partial", "missing"]},
+                            "notes": {"type": "string"}
+                        },
+                        "required": ["disclosure_type", "is_present"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "flag_issue",
+                    "description": "Flag a potential compliance issue",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "issue_type": {"type": "string"},
+                            "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                            "description": {"type": "string"},
+                            "recommendation": {"type": "string"}
+                        },
+                        "required": ["issue_type", "severity", "description"]
+                    }
+                }
+            }
+        ]
+    
+    def analyze(self, question: str, context: str) -> Dict:
+        """Perform compliance check"""
+        prompt = f"""Review the following SEC filing content for compliance.
+
+Context from SEC 10-K filing:
+{context}
+
+Question: {question}
+
+Check for required disclosures and flag any compliance issues."""
+
+        response = self.client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            tools=self.get_tools(),
+            tool_choice="auto"
+        )
+        
+        return self._process_response(response, question)
+    
+    def _process_response(self, response, question: str) -> Dict:
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+        
+        disclosures = []
+        issues = []
+        
+        for tool_call in tool_calls:
+            try:
+                args = json.loads(tool_call.function.arguments)
+                if tool_call.function.name == "check_disclosure":
+                    disclosures.append(args)
+                elif tool_call.function.name == "flag_issue":
+                    issues.append(args)
+            except:
+                pass
+        
+        final_prompt = f"""Based on your compliance review:
+Question: {question}
+Disclosures Checked: {json.dumps(disclosures)}
+Issues Found: {json.dumps(issues)}
+
+Provide a compliance assessment summary."""
+
+        final_response = self.client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": final_prompt}
+            ]
+        )
+        
+        return {
+            "answer": final_response.choices[0].message.content,
+            "disclosures": disclosures,
+            "issues": issues,
+            "agent": self.name
+        }
+
+
+class RiskAssessmentAgent:
+    """Specialized agent for risk analysis"""
+    
+    def __init__(self, client):
+        self.client = client
+        self.name = "Risk Analyst"
+        self.system_prompt = """You are a risk assessment expert. Your role is to:
+- Identify and categorize business risks
+- Assess risk severity and likelihood
+- Compare risks across categories
+- Provide risk mitigation insights"""
+    
+    def get_tools(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "identify_risk",
+                    "description": "Identify a specific risk factor",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "risk_name": {"type": "string"},
+                            "category": {"type": "string", "enum": ["financial", "operational", "regulatory", "market", "cybersecurity", "environmental", "competitive"]},
+                            "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                            "description": {"type": "string"}
+                        },
+                        "required": ["risk_name", "category", "severity"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "assess_impact",
+                    "description": "Assess the potential impact of a risk",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "risk_name": {"type": "string"},
+                            "financial_impact": {"type": "string"},
+                            "likelihood": {"type": "string", "enum": ["unlikely", "possible", "likely", "very_likely"]},
+                            "mitigation": {"type": "string"}
+                        },
+                        "required": ["risk_name", "likelihood"]
+                    }
+                }
+            }
+        ]
+    
+    def analyze(self, question: str, context: str) -> Dict:
+        """Perform risk assessment"""
+        prompt = f"""Analyze the following SEC filing for risk factors.
+
+Context from SEC 10-K filing:
+{context}
+
+Question: {question}
+
+Identify risks, assess their severity, and provide insights."""
+
+        response = self.client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            tools=self.get_tools(),
+            tool_choice="auto"
+        )
+        
+        return self._process_response(response, question)
+    
+    def _process_response(self, response, question: str) -> Dict:
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+        
+        risks = []
+        impacts = []
+        
+        for tool_call in tool_calls:
+            try:
+                args = json.loads(tool_call.function.arguments)
+                if tool_call.function.name == "identify_risk":
+                    risks.append(args)
+                elif tool_call.function.name == "assess_impact":
+                    impacts.append(args)
+            except:
+                pass
+        
+        final_prompt = f"""Based on your risk assessment:
+Question: {question}
+Identified Risks: {json.dumps(risks)}
+Impact Assessments: {json.dumps(impacts)}
+
+Provide a comprehensive risk analysis summary."""
+
+        final_response = self.client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": final_prompt}
+            ]
+        )
+        
+        return {
+            "answer": final_response.choices[0].message.content,
+            "risks": risks,
+            "impacts": impacts,
+            "agent": self.name
+        }
+
+
+class AgentRouter:
+    """Routes questions to appropriate specialized agents"""
+    
+    # Keywords that trigger each agent
+    ANALYST_KEYWORDS = ["revenue", "profit", "margin", "ratio", "calculate", "growth", "earnings", 
+                        "expense", "income", "eps", "ebitda", "cash flow", "financial", "metric"]
+    COMPLIANCE_KEYWORDS = ["compliance", "regulation", "disclosure", "sec", "audit", "requirement",
+                          "filing", "report", "statement", "governance", "control"]
+    RISK_KEYWORDS = ["risk", "threat", "challenge", "uncertainty", "exposure", "vulnerability",
+                    "cybersecurity", "competition", "regulatory risk", "market risk"]
+    
+    def __init__(self, client):
+        self.client = client
+        self.analyst_agent = FinancialAnalystAgent(client)
+        self.compliance_agent = ComplianceAgent(client)
+        self.risk_agent = RiskAssessmentAgent(client)
+    
+    def detect_agent_need(self, question: str) -> tuple:
+        """Detect which agent(s) should handle the question"""
+        question_lower = question.lower()
+        
+        scores = {
+            "analyst": sum(1 for kw in self.ANALYST_KEYWORDS if kw in question_lower),
+            "compliance": sum(1 for kw in self.COMPLIANCE_KEYWORDS if kw in question_lower),
+            "risk": sum(1 for kw in self.RISK_KEYWORDS if kw in question_lower)
+        }
+        
+        # Determine if agents are needed and which one
+        max_score = max(scores.values())
+        if max_score == 0:
+            return False, None  # Use standard RAG
+        
+        # Return the agent with highest score
+        primary_agent = max(scores, key=scores.get)
+        return True, primary_agent
+    
+    def route_and_execute(self, question: str, context: str) -> Dict:
+        """Route question to appropriate agent and execute"""
+        needs_agent, agent_type = self.detect_agent_need(question)
+        
+        if not needs_agent:
+            return None  # Signal to use standard RAG
+        
+        # Execute the appropriate agent
+        if agent_type == "analyst":
+            result = self.analyst_agent.analyze(question, context)
+        elif agent_type == "compliance":
+            result = self.compliance_agent.analyze(question, context)
+        elif agent_type == "risk":
+            result = self.risk_agent.analyze(question, context)
+        else:
+            return None
+        
+        result["agent_type"] = agent_type
+        return result
+
+
+# ============== MAIN RAG SYSTEM ==============
+
 class FinancialRAGSystem:
-    """Main RAG system for financial document analysis"""
+    """Main RAG system for financial document analysis with hybrid RAG + Agent support"""
 
     def __init__(self, openai_api_key: str):
         self.client = OpenAI(api_key=openai_api_key)
@@ -68,6 +459,8 @@ class FinancialRAGSystem:
         self.bm25 = None
         self.chunks = []
         self.doc_processor = SECDocumentProcessor()
+        # Initialize agent router for hybrid mode
+        self.agent_router = AgentRouter(self.client)
 
     def _truncate_text(self, text: str, max_chars: int = 8000) -> str:
         """Truncate text to fit within embedding model token limits.
@@ -384,17 +777,60 @@ Keep your answer concise but comprehensive."""
                 'insights': []
             }
 
-    def query(self, question: str) -> Dict[str, Any]:
-        """Main query interface"""
+    def query(self, question: str, force_mode: str = None) -> Dict[str, Any]:
+        """Main query interface with hybrid RAG + Agent support
+        
+        Args:
+            question: The user's question
+            force_mode: Optional - 'rag' for RAG-only, 'agent' for agent-only, None for auto-detect
+        
+        Returns:
+            Dict with answer, sources, and metadata about which mode was used
+        """
         if not self.chunks:
             return {"error": "No documents indexed. Please load documents first."}
 
-        # Retrieve relevant chunks
+        # Retrieve relevant chunks (always needed for context)
         retrieved = self.hybrid_retrieve(question, top_k=5)
+        context = "\n\n".join([
+            f"[Source {i+1}: {chunk['source']}]\n{chunk['text']}"
+            for i, chunk in enumerate(retrieved)
+        ])
 
-        # Generate answer
+        # Determine which mode to use
+        if force_mode == 'rag':
+            use_agents = False
+        elif force_mode == 'agent':
+            use_agents = True
+        else:
+            # Auto-detect based on question
+            use_agents, _ = self.agent_router.detect_agent_need(question)
+
+        if use_agents:
+            # Use agent-based approach
+            agent_result = self.agent_router.route_and_execute(question, context)
+            
+            if agent_result:
+                return {
+                    'answer': agent_result['answer'],
+                    'retrieved_chunks': retrieved,
+                    'metrics': {},
+                    'calculations': agent_result.get('calculations', []),
+                    'insights': [],
+                    'mode': 'agent',
+                    'agent_used': agent_result.get('agent', 'Unknown'),
+                    'agent_data': {
+                        'extracted_data': agent_result.get('extracted_data', []),
+                        'risks': agent_result.get('risks', []),
+                        'disclosures': agent_result.get('disclosures', []),
+                        'issues': agent_result.get('issues', [])
+                    }
+                }
+        
+        # Use standard RAG approach
         result = self.generate_answer(question, retrieved)
-
+        result['mode'] = 'rag'
+        result['agent_used'] = None
         return result
 
 
@@ -526,11 +962,53 @@ def main():
                 if 'error' in result:
                     st.error(f"❌ {result['error']}")
                 else:
+                    # Show which mode was used
+                    mode = result.get('mode', 'rag')
+                    agent_used = result.get('agent_used')
+                    
+                    if mode == 'agent' and agent_used:
+                        st.success(f"🤖 **Agent Mode:** {agent_used}")
+                    else:
+                        st.info("📚 **RAG Mode:** Direct retrieval and generation")
+                    
                     # Display answer
                     st.header("📝 Answer")
                     st.markdown(result['answer'])
 
-                    # Display metrics
+                    # Display agent-specific data if available
+                    agent_data = result.get('agent_data', {})
+                    
+                    # Display extracted financial data (from analyst agent)
+                    if agent_data.get('extracted_data'):
+                        st.header("📊 Extracted Financial Data")
+                        for item in agent_data['extracted_data']:
+                            col1, col2 = st.columns([2, 1])
+                            with col1:
+                                st.write(f"**{item.get('metric_name', 'Metric')}**")
+                            with col2:
+                                value = item.get('value', 'N/A')
+                                unit = item.get('unit', '')
+                                st.write(f"{value} {unit}")
+                    
+                    # Display risks (from risk agent)
+                    if agent_data.get('risks'):
+                        st.header("⚠️ Identified Risks")
+                        for risk in agent_data['risks']:
+                            severity = risk.get('severity', 'unknown')
+                            severity_color = {'low': '🟢', 'medium': '🟡', 'high': '🟠', 'critical': '🔴'}.get(severity, '⚪')
+                            st.write(f"{severity_color} **{risk.get('risk_name', 'Risk')}** ({risk.get('category', 'General')})")
+                            st.caption(risk.get('description', ''))
+                    
+                    # Display compliance issues (from compliance agent)
+                    if agent_data.get('issues'):
+                        st.header("🔍 Compliance Issues")
+                        for issue in agent_data['issues']:
+                            severity = issue.get('severity', 'unknown')
+                            severity_color = {'low': '🟢', 'medium': '🟡', 'high': '🔴'}.get(severity, '⚪')
+                            st.write(f"{severity_color} **{issue.get('issue_type', 'Issue')}**")
+                            st.caption(issue.get('description', ''))
+
+                    # Display metrics (from RAG mode)
                     if result.get('metrics') and len(result['metrics']) > 0:
                         st.header("📊 Computed Metrics")
                         metric_cols = st.columns(min(len(result['metrics']), 4))
@@ -542,7 +1020,12 @@ def main():
                     if result.get('calculations') and len(result['calculations']) > 0:
                         st.header("🧮 Calculations")
                         for i, calc in enumerate(result['calculations'], 1):
-                            st.markdown(f"{i}. {calc}")
+                            if isinstance(calc, dict):
+                                st.write(f"**{calc.get('ratio_name', 'Calculation')}:** {calc.get('result', 'N/A')}")
+                                if calc.get('formula'):
+                                    st.caption(f"Formula: {calc['formula']}")
+                            else:
+                                st.markdown(f"{i}. {calc}")
 
                     # Display insights
                     if result.get('insights') and len(result['insights']) > 0:

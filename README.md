@@ -9,6 +9,8 @@ AI-powered Q&A for SEC 10-K filings using Retrieval-Augmented Generation.
 - 🤖 AI-generated answers with citations
 - 📊 Automatic financial metric extraction
 - 💾 Local caching of downloaded filings
+- 🎯 Smart agent routing (auto-selects RAG or Agent mode)
+- 👨‍💼 Specialized agents: Financial Analyst, Risk Analyst, Compliance Officer
 
 ## Tech Stack
 
@@ -20,6 +22,8 @@ AI-powered Q&A for SEC 10-K filings using Retrieval-Augmented Generation.
 - **Data Source:** SEC EDGAR
 
 ## Setup
+
+**Requires:** Python 3.10+
 
 ### 1. Install Dependencies
 

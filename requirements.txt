@@ -1,54 +1,23 @@
-# Financial RAG Analyst Assistant - Python Dependencies
-# FE524 Project Requirements
-#
-# Install with uv (recommended):
-#   uv venv
-#   .venv\Scripts\activate  (Windows) or source .venv/bin/activate (Mac/Linux)
-#   uv pip install -r requirements.txt
-#
-# Or quick install: uv pip install -r requirements.txt
+# Financial RAG Analyst - Dependencies
+# Install: uv pip install -r requirements.txt
 
-# Core ML & NLP
+# Core
 openai>=1.0.0
-python-dotenv>=1.0.0  # For loading .env file
-# sentence-transformers>=2.2.2  # No longer needed - using OpenAI text-embedding-3-small
-# transformers>=4.30.0  # No longer needed - using OpenAI embeddings
+python-dotenv>=1.0.0
 
 # Vector Database & Search
 chromadb>=0.4.0
 rank-bm25>=0.2.2
-faiss-cpu>=1.7.4
 
 # Document Processing
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
-pypdf>=3.15.0
-python-docx>=0.8.11
 
 # SEC Filing Downloads
 sec-edgar-downloader>=5.0.0
-requests>=2.31.0
 
 # Data Processing
-pandas>=2.0.0
 numpy>=1.24.0
 
 # Web Interface
 streamlit>=1.28.0
-
-# LangChain (optional, for advanced features)
-langchain>=0.0.300
-langchain-openai>=0.0.2
-
-# Utilities
-tqdm>=4.65.0
-pyyaml>=6.0
-
-# Development & Testing
-pytest>=7.4.0
-black>=23.7.0
-flake8>=6.1.0
-
-# Optional GPU Support (uncomment if using CUDA)
-# faiss-gpu>=1.7.4
-# torch>=2.0.0
