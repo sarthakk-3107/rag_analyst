@@ -12,7 +12,7 @@ AI-powered Q&A for SEC 10-K filings using Retrieval-Augmented Generation.
 
 ## Tech Stack
 
-- **LLM:** OpenAI GPT-4.1-mini
+- **LLM:** OpenAI GPT-5-mini
 - **Embeddings:** OpenAI text-embedding-3-small
 - **Vector DB:** ChromaDB
 - **Keyword Search:** BM25
@@ -37,6 +37,10 @@ uv pip install -r requirements.txt
 ```
 
 ### 2. Configure API Key
+
+**Important:** Your OpenAI API key must have access to:
+- `gpt-5-mini` (for LLM)
+- `text-embedding-3-small` (for embeddings)
 
 Create a `.env` file:
 

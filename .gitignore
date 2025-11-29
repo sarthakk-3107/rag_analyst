@@ -92,3 +92,5 @@ dmypy.json
 *.manifest
 *.spec
 
+# Spec Sheet
+spec_sheet.txt
