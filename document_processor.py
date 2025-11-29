@@ -106,19 +106,37 @@ class SECDocumentProcessor:
     def split_into_sections(self, text: str) -> Dict[str, str]:
         """Split 10-K into standard sections"""
         sections = {}
+        
+        # Normalize text for better matching
+        # Replace multiple spaces/newlines with single space for pattern matching
+        normalized_text = re.sub(r'\s+', ' ', text)
 
         # Create patterns for each section
         for item_num, item_title in self.SECTIONS.items():
+            # Extract just the number part (e.g., "1", "1A", "7A")
+            num_part = item_num.replace("Item ", "")
+            
             # Multiple pattern variations to catch different formats
+            # SEC filings have many different formatting styles
             patterns = [
-                rf"(?:^|\n)\s*{re.escape(item_num)}[\.\-\s]+{re.escape(item_title)}",
-                rf"(?:^|\n)\s*{re.escape(item_num.upper())}[\.\-\s]+{re.escape(item_title.upper())}",
-                rf"(?:^|\n)\s*{re.escape(item_num)}[\.\-\s:]+.*?{re.escape(item_title)}"
+                # Standard formats: "Item 1. Business", "ITEM 1 - BUSINESS"
+                rf"(?:^|\s)ITEM\s*{re.escape(num_part)}[\.\-\:\s]+{re.escape(item_title)}",
+                rf"(?:^|\s)Item\s*{re.escape(num_part)}[\.\-\:\s]+{re.escape(item_title)}",
+                # Just item number with any text after
+                rf"(?:^|\s)ITEM\s*{re.escape(num_part)}[\.\-\:\s]+[A-Z]",
+                rf"(?:^|\s)Item\s*{re.escape(num_part)}[\.\-\:\s]+[A-Za-z]",
+                # Item number at start of line/section
+                rf"ITEM\s+{re.escape(num_part)}\b",
+                rf"Item\s+{re.escape(num_part)}\b",
+                # With parentheses or brackets
+                rf"\(ITEM\s*{re.escape(num_part)}\)",
+                # Numbered format without "Item" prefix in some filings
+                rf"(?:^|\s){re.escape(num_part)}[\.\)]\s*{re.escape(item_title)}",
             ]
 
             matches = []
             for pattern in patterns:
-                matches.extend(list(re.finditer(pattern, text, re.IGNORECASE)))
+                matches.extend(list(re.finditer(pattern, normalized_text, re.IGNORECASE)))
 
             if matches:
                 # Use the first match found
@@ -129,16 +147,19 @@ class SECDocumentProcessor:
                 remaining_items = [k for k in self.SECTIONS.keys() if k > item_num]
 
                 for next_item in remaining_items:
+                    next_num = next_item.replace("Item ", "")
                     next_patterns = [
-                        rf"(?:^|\n)\s*{re.escape(next_item)}[\.\-\s]+",
-                        rf"(?:^|\n)\s*{re.escape(next_item.upper())}[\.\-\s]+"
+                        rf"(?:^|\s)ITEM\s*{re.escape(next_num)}[\.\-\:\s]+",
+                        rf"(?:^|\s)Item\s*{re.escape(next_num)}[\.\-\:\s]+",
+                        rf"ITEM\s+{re.escape(next_num)}\b",
+                        rf"Item\s+{re.escape(next_num)}\b",
                     ]
 
                     for next_pattern in next_patterns:
-                        next_match = re.search(next_pattern, text[start_pos:], re.IGNORECASE)
+                        next_match = re.search(next_pattern, normalized_text[start_pos:], re.IGNORECASE)
                         if next_match:
                             end_pos = start_pos + next_match.start()
-                            sections[item_num] = text[start_pos:end_pos].strip()
+                            sections[item_num] = normalized_text[start_pos:end_pos].strip()
                             next_section_found = True
                             break
 
@@ -147,7 +168,7 @@ class SECDocumentProcessor:
 
                 # If no next section found, take rest of document (but limit to 100k chars)
                 if not next_section_found:
-                    sections[item_num] = text[start_pos:start_pos + 100000].strip()
+                    sections[item_num] = normalized_text[start_pos:start_pos + 100000].strip()
 
         return sections
 
@@ -217,6 +238,49 @@ class SECDocumentProcessor:
 
         return metrics
 
+    def extract_sections_fallback(self, text: str, metadata: Dict) -> List[SECSection]:
+        """Fallback section extraction using keyword-based chunking.
+        
+        Used when structured section parsing fails.
+        Creates logical sections based on content keywords.
+        """
+        sections = []
+        
+        # Define keyword patterns for important content areas
+        content_areas = [
+            ('Business Overview', r'(?:business|overview|company\s+description|who\s+we\s+are)', 'Item 1'),
+            ('Risk Factors', r'(?:risk\s+factors?|risks?\s+relating|principal\s+risks?)', 'Item 1A'),
+            ('Financial Discussion', r'(?:management.s?\s+discussion|MD&A|results\s+of\s+operations)', 'Item 7'),
+            ('Financial Statements', r'(?:financial\s+statements?|balance\s+sheet|income\s+statement|consolidated)', 'Item 8'),
+            ('Executive Officers', r'(?:executive\s+officers?|directors?\s+and\s+officers?|corporate\s+governance)', 'Item 10'),
+        ]
+        
+        # Normalize text
+        normalized = re.sub(r'\s+', ' ', text)
+        text_lower = normalized.lower()
+        
+        for title, pattern, item_num in content_areas:
+            matches = list(re.finditer(pattern, text_lower, re.IGNORECASE))
+            if matches:
+                # Get content starting from first match
+                start_pos = matches[0].start()
+                # Take up to 50000 chars or until next section keyword
+                end_pos = min(start_pos + 50000, len(normalized))
+                
+                content = normalized[start_pos:end_pos].strip()
+                if len(content) > 500:  # Only keep substantial sections
+                    section = SECSection(
+                        section_number=item_num,
+                        section_title=title,
+                        content=content,
+                        company=metadata.get('company_name', 'Unknown'),
+                        filing_date=metadata.get('filing_date', ''),
+                        form_type='10-K'
+                    )
+                    sections.append(section)
+        
+        return sections
+
     def process_filing(self, filepath: str) -> Tuple[List[SECSection], Dict]:
         """Main processing pipeline for a 10-K filing"""
 
@@ -239,20 +303,31 @@ class SECDocumentProcessor:
         # Create SECSection objects
         sections = []
         for item_num, content in sections_dict.items():
-            section = SECSection(
-                section_number=item_num,
-                section_title=self.SECTIONS[item_num],
-                content=content,
-                company=metadata.get('company_name', 'Unknown'),
-                filing_date=metadata.get('filing_date', ''),
-                form_type='10-K'
-            )
-            sections.append(section)
+            if content and len(content) > 100:  # Only keep non-empty sections
+                section = SECSection(
+                    section_number=item_num,
+                    section_title=self.SECTIONS[item_num],
+                    content=content,
+                    company=metadata.get('company_name', 'Unknown'),
+                    filing_date=metadata.get('filing_date', ''),
+                    form_type='10-K'
+                )
+                sections.append(section)
+
+        # If no sections found with structured parsing, try fallback
+        if len(sections) == 0:
+            sections = self.extract_sections_fallback(clean_text, metadata)
+            if sections:
+                metadata['parsing_method'] = 'fallback_keyword'
+            else:
+                metadata['parsing_method'] = 'full_document'
+        else:
+            metadata['parsing_method'] = 'structured'
 
         return sections, metadata
 
-    def chunk_section(self, section: SECSection, chunk_size: int = 1000,
-                     overlap: int = 200) -> List[Dict]:
+    def chunk_section(self, section: SECSection, chunk_size: int = 500,
+                     overlap: int = 100) -> List[Dict]:
         """Chunk a section into smaller pieces for RAG"""
         words = section.content.split()
         chunks = []

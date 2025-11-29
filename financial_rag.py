@@ -2,30 +2,40 @@
 Financial Filings RAG Analyst Assistant - Main Application
 FE524 Project - Phase 1
 
-Dependencies:
-pip install openai chromadb sentence-transformers rank-bm25 sec-edgar-downloader streamlit pandas numpy beautifulsoup4 lxml
+Dependencies (using uv):
+uv venv
+.venv\\Scripts\\activate  # Windows
+uv pip install -r requirements.txt
 
-Set your API key before running:
-Windows CMD: set OPENAI_API_KEY=your-key-here
-Windows PowerShell: $env:OPENAI_API_KEY="your-key-here"
-Mac/Linux: export OPENAI_API_KEY=your-key-here
+Or create a virtual environment:
+uv venv
+.venv\\Scripts\\activate  (Windows) or source .venv/bin/activate (Mac/Linux)
+uv pip install -r requirements.txt
 
-Then run: streamlit run financial_rag_app.py
+API key setup:
+Create a .env file in this directory with:
+OPENAI_API_KEY=your-key-here
+
+Then run: streamlit run financial_rag.py
 """
 
 import os
 import json
 from typing import List, Dict, Any
 from dataclasses import dataclass
+from pathlib import Path
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 import numpy as np
 from openai import OpenAI
 import streamlit as st
 from sec_edgar_downloader import Downloader
-from pathlib import Path
 
 # Import document processor
 try:
@@ -47,25 +57,89 @@ class FinancialRAGSystem:
 
     def __init__(self, openai_api_key: str):
         self.client = OpenAI(api_key=openai_api_key)
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        # Using OpenAI's text-embedding-3-small for better semantic search
+        self.embedding_model_name = "text-embedding-3-small"
         self.chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
         self.collection = None
         self.bm25 = None
         self.chunks = []
         self.doc_processor = SECDocumentProcessor()
 
+    def _truncate_text(self, text: str, max_chars: int = 8000) -> str:
+        """Truncate text to fit within embedding model token limits.
+        
+        text-embedding-3-small has 8192 token limit.
+        Using conservative estimate: ~1 token per 3 chars.
+        8000 chars ≈ 2600 tokens (safe margin under 8192 limit).
+        """
+        if len(text) > max_chars:
+            return text[:max_chars]
+        return text
+
+    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings using OpenAI API (text-embedding-3-small)"""
+        # Truncate texts to fit within model's token limit
+        truncated_texts = [self._truncate_text(t) for t in texts]
+        
+        # Small batch size to avoid hitting API limits
+        batch_size = 10
+        all_embeddings = []
+        
+        for i in range(0, len(truncated_texts), batch_size):
+            batch = truncated_texts[i:i + batch_size]
+            try:
+                response = self.client.embeddings.create(
+                    model=self.embedding_model_name,
+                    input=batch
+                )
+                batch_embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(batch_embeddings)
+            except Exception as e:
+                # If batch fails, try one at a time with more aggressive truncation
+                for text in batch:
+                    try:
+                        # Even more aggressive truncation for problematic texts
+                        safe_text = text[:5000] if len(text) > 5000 else text
+                        response = self.client.embeddings.create(
+                            model=self.embedding_model_name,
+                            input=[safe_text]
+                        )
+                        all_embeddings.append(response.data[0].embedding)
+                    except Exception as inner_e:
+                        # Last resort: very short text
+                        response = self.client.embeddings.create(
+                            model=self.embedding_model_name,
+                            input=[text[:2000]]
+                        )
+                        all_embeddings.append(response.data[0].embedding)
+        
+        return all_embeddings
+
     def download_10k(self, ticker: str, email: str, num_filings: int = 1):
-        """Download SEC 10-K filings for a company"""
+        """Download SEC 10-K filings for a company.
+        
+        Returns:
+            tuple: (filepath, was_cached) - filepath to the filing, and whether it was already cached
+        """
+        filing_dir = f"sec-edgar-filings/{ticker}/10-K"
+        
+        # Check if filing already exists locally
+        if os.path.exists(filing_dir):
+            files = list(Path(filing_dir).rglob("*.txt"))
+            if files:
+                # Filing already downloaded, return existing file
+                return str(files[0]), True  # True = already cached
+        
+        # Download if not found locally
         dl = Downloader("FE524-Project", email)
         dl.get("10-K", ticker, limit=num_filings)
-        filing_dir = f"sec-edgar-filings/{ticker}/10-K"
-
+        
         # Find the downloaded filing
         if os.path.exists(filing_dir):
             files = list(Path(filing_dir).rglob("*.txt"))
             if files:
-                return str(files[0])
-        return None
+                return str(files[0]), False  # False = newly downloaded
+        return None, False
 
     def process_and_index_filing(self, filepath: str) -> int:
         """Process SEC filing and create searchable index"""
@@ -74,6 +148,16 @@ class FinancialRAGSystem:
 
         # Create chunks from all sections
         all_chunks = []
+        
+        # Check parsing method and provide feedback
+        parsing_method = metadata.get('parsing_method', 'unknown')
+        
+        if parsing_method == 'structured':
+            st.success(f"✅ Successfully parsed {len(sections)} document sections")
+        elif parsing_method == 'fallback_keyword':
+            st.info(f"ℹ️ Used keyword-based parsing. Found {len(sections)} content sections.")
+        elif parsing_method == 'full_document':
+            st.warning("⚠️ Section headers not found. Using full document chunking.")
 
         if sections and len(sections) > 0:
             # Process each section
@@ -89,15 +173,14 @@ class FinancialRAGSystem:
                     )
                     all_chunks.append(chunk)
         else:
-            # Fallback: If no sections found, chunk the entire document
-            st.warning("⚠️ Could not parse document sections. Using full document chunking...")
+            # Final fallback: chunk the entire document
             raw_content = self.doc_processor.read_filing(filepath)
             clean_text = self.doc_processor.clean_html(raw_content)
 
-            # Create chunks from full text
+            # Create chunks from full text (smaller chunks to fit embedding model limits)
             words = clean_text.split()
-            chunk_size = 1000
-            overlap = 200
+            chunk_size = 500
+            overlap = 100
 
             for i in range(0, len(words), chunk_size - overlap):
                 chunk_text = ' '.join(words[i:i + chunk_size])
@@ -124,12 +207,12 @@ class FinancialRAGSystem:
         """Create vector and BM25 indexes for document chunks"""
         self.chunks = chunks
 
-        # Create vector embeddings
+        # Create vector embeddings using OpenAI API
         texts = [chunk.text for chunk in chunks]
-        embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
+        embeddings = self.get_embeddings(texts)
 
         for chunk, embedding in zip(chunks, embeddings):
-            chunk.embedding = embedding
+            chunk.embedding = np.array(embedding)
 
         # Initialize ChromaDB collection
         try:
@@ -144,7 +227,7 @@ class FinancialRAGSystem:
 
         # Add to ChromaDB
         self.collection.add(
-            embeddings=embeddings.tolist(),
+            embeddings=embeddings,  # Already a list from OpenAI API
             documents=texts,
             metadatas=[chunk.metadata for chunk in chunks],
             ids=[f"chunk_{i}" for i in range(len(chunks))]
@@ -159,10 +242,10 @@ class FinancialRAGSystem:
     def hybrid_retrieve(self, query: str, top_k: int = 5) -> List[Dict]:
         """Hybrid retrieval using dense embeddings and BM25"""
 
-        # Dense retrieval (semantic search)
-        query_embedding = self.embedding_model.encode([query])[0]
+        # Dense retrieval (semantic search) using OpenAI embeddings
+        query_embedding = self.get_embeddings([query])[0]
         dense_results = self.collection.query(
-            query_embeddings=[query_embedding.tolist()],
+            query_embeddings=[query_embedding],  # Already a list from OpenAI API
             n_results=top_k * 2
         )
 
@@ -225,7 +308,7 @@ Format your response as JSON:
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Changed from gpt-4o
+                model="gpt-4.1-mini",  # Upgraded from gpt-4o-mini for better financial analysis
                 messages=[
                     {"role": "system", "content": "You are a financial analyst expert at extracting data and performing calculations."},
                     {"role": "user", "content": calculation_prompt}
@@ -275,7 +358,7 @@ Keep your answer concise but comprehensive."""
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Changed from gpt-4o
+                model="gpt-4.1-mini",  # Upgraded from gpt-4o-mini for better financial analysis
                 messages=[
                     {"role": "system", "content": "You are an expert financial analyst providing evidence-based insights."},
                     {"role": "user", "content": answer_prompt}
@@ -317,9 +400,8 @@ Keep your answer concise but comprehensive."""
 def main():
     st.set_page_config(page_title="Financial RAG Analyst", page_icon="📊", layout="wide")
 
-    st.title("📊 Financial Filings RAG Analyst Assistant")
-    st.markdown("*AI-powered analysis of SEC 10-K filings using RAG*")
-    st.markdown("**FE524 Project - Phase 1**")
+    st.title("📊 Financial RAG Analyst")
+    st.markdown("*Ask questions about company 10-K filings and get AI-powered insights*")
 
     # Check for API key in environment
     api_key = os.environ.get('OPENAI_API_KEY')
@@ -327,40 +409,22 @@ def main():
     if not api_key:
         st.error("❌ OpenAI API key not found!")
         st.info("""
-        Please set your API key as an environment variable:
-        
-        **Windows Command Prompt:**
+        Create a `.env` file in the project folder with:
         ```
-        set OPENAI_API_KEY=your-key-here
+        OPENAI_API_KEY=your-key-here
         ```
-        
-        **Windows PowerShell:**
-        ```
-        $env:OPENAI_API_KEY="your-key-here"
-        ```
-        
-        **Mac/Linux:**
-        ```
-        export OPENAI_API_KEY=your-key-here
-        ```
-        
-        Then run: `streamlit run financial_rag_app.py` in the same terminal.
+        Then restart the app.
         """)
         st.stop()
-    else:
-        st.success("✅ OpenAI API key detected from environment")
 
     # Sidebar for configuration
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        st.info("🔑 API Key loaded from environment")
+        st.header("📁 Load Company Filing")
+        ticker = st.text_input("Company Ticker", "AAPL", help="e.g., AAPL, MSFT, TSLA, GOOGL")
+        email = st.text_input("Your Email", "user@email.com", help="Required by SEC for downloading")
 
-        st.header("📁 Document Management")
-        ticker = st.text_input("Company Ticker", "AAPL", help="Enter stock ticker symbol (e.g., AAPL, MSFT, TSLA)")
-        email = st.text_input("Your Email (for SEC)", "student@stevens.edu", help="Required by SEC Edgar")
-
-        if st.button("📥 Download & Index 10-K", type="primary"):
-            with st.spinner("Downloading and processing 10-K filing..."):
+        if st.button("📥 Load 10-K Filing", type="primary", use_container_width=True):
+            with st.spinner(f"Loading {ticker} 10-K..."):
                 try:
                     # Initialize or get RAG system
                     if 'rag_system' not in st.session_state:
@@ -368,36 +432,38 @@ def main():
 
                     rag_system = st.session_state['rag_system']
 
-                    # Download filing
-                    st.info(f"📥 Downloading {ticker} 10-K filing from SEC Edgar...")
-                    filepath = rag_system.download_10k(ticker, email)
+                    # Check for existing or download filing
+                    filepath, was_cached = rag_system.download_10k(ticker, email)
 
                     if not filepath:
-                        st.error("Failed to download filing. Please check ticker symbol.")
+                        st.error("Could not find filing. Check the ticker symbol.")
                     else:
-                        st.success(f"✅ Downloaded filing: {Path(filepath).name}")
-
+                        # Show whether using cached or newly downloaded
+                        if was_cached:
+                            st.info(f"📂 Using cached {ticker} filing")
+                        else:
+                            st.success(f"📥 Downloaded {ticker} filing")
+                        
                         # Process and index
-                        st.info("🔄 Processing document sections...")
                         num_chunks, metadata = rag_system.process_and_index_filing(filepath)
 
                         # Store metadata in session
                         st.session_state['metadata'] = metadata
                         st.session_state['ticker'] = ticker
 
-                        st.success(f"✅ Indexed {num_chunks} document chunks")
+                        st.success(f"✅ Ready! {num_chunks} sections indexed")
                         st.balloons()
 
-                        # Display metadata
-                        st.markdown("---")
-                        st.subheader("📄 Document Info")
-                        st.write(f"**Company:** {metadata.get('company_name', ticker)}")
-                        st.write(f"**Filing Date:** {metadata.get('filing_date', 'N/A')}")
-                        st.write(f"**CIK:** {metadata.get('cik', 'N/A')}")
-
                 except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
-                    st.exception(e)
+                    st.error(f"Error: {str(e)}")
+        
+        # Show loaded document info
+        if 'metadata' in st.session_state:
+            st.markdown("---")
+            st.subheader("📄 Loaded Document")
+            metadata = st.session_state['metadata']
+            st.write(f"**{metadata.get('company_name', st.session_state.get('ticker', 'Unknown'))}**")
+            st.caption(f"Filed: {metadata.get('filing_date', 'N/A')}")
 
         st.markdown("---")
         st.header("📋 Sample Questions")
@@ -412,7 +478,14 @@ def main():
         for q in sample_questions:
             if st.button(q, key=f"sample_{q}"):
                 st.session_state['query'] = q
+                st.session_state['auto_analyze'] = True  # Flag to auto-run analysis
+                st.rerun()  # Rerun to trigger analysis
 
+    # Show welcome message if no document loaded
+    if 'rag_system' not in st.session_state:
+        st.info("👈 **Get started:** Enter a company ticker in the sidebar and click 'Load 10-K Filing'")
+        st.markdown("---")
+    
     # Main query interface
     st.header("💬 Ask a Question")
 
@@ -420,10 +493,10 @@ def main():
     default_query = st.session_state.get('query', '')
 
     query = st.text_area(
-        "Enter your financial analysis question:",
+        "What would you like to know?",
         value=default_query,
-        height=100,
-        placeholder="e.g., What was the revenue growth rate from 2022 to 2023?",
+        height=80,
+        placeholder="e.g., What was the total revenue? What are the main risks?",
         key="query_input"
     )
 
@@ -431,18 +504,21 @@ def main():
     with col1:
         analyze_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
     with col2:
-        if st.button("🗑️ Clear Session", use_container_width=True):
+        if st.button("🗑️ Clear", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
-    # Process query
-    if analyze_btn and query:
+    # Check if auto-analyze was triggered by sample question
+    auto_analyze = st.session_state.pop('auto_analyze', False)
+    
+    # Process query (either from button click or auto-analyze)
+    if (analyze_btn or auto_analyze) and query:
         if 'rag_system' not in st.session_state:
-            st.warning("⚠️ Please download and index a 10-K filing first using the sidebar.")
+            st.warning("Please load a 10-K filing first using the sidebar.")
         else:
             rag_system = st.session_state['rag_system']
 
-            with st.spinner("🔍 Analyzing documents and generating response..."):
+            with st.spinner("Analyzing..."):
                 result = rag_system.query(query)
 
                 if 'error' in result:
@@ -473,8 +549,7 @@ def main():
                             st.markdown(f"- {insight}")
 
                     # Display retrieved chunks
-                    st.header("📄 Retrieved Document Sections")
-                    st.caption("These are the most relevant sections used to generate the answer")
+                    st.header("📄 Sources")
 
                     for i, chunk in enumerate(result['retrieved_chunks'], 1):
                         with st.expander(
@@ -486,7 +561,7 @@ def main():
 
     # Footer
     st.markdown("---")
-    st.caption("FE524-A: Prompt Engineering Lab | Financial RAG Analyst Assistant | Phase 1 Implementation")
+    st.caption("Financial RAG Analyst • Powered by OpenAI • Data from SEC EDGAR")
 
 if __name__ == "__main__":
     main()
