@@ -13,6 +13,10 @@ uv venv
 uv pip install -r requirements.txt
 
 API key setup:
+Your OpenAI API key must have access to:
+- gpt-5-mini (for LLM)
+- text-embedding-3-small (for embeddings)
+
 Create a .env file in this directory with:
 OPENAI_API_KEY=your-key-here
 
@@ -308,12 +312,11 @@ Format your response as JSON:
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4.1-mini",  # Upgraded from gpt-4o-mini for better financial analysis
+                model="gpt-5-mini",  # Using GPT-5-mini for advanced financial analysis
                 messages=[
                     {"role": "system", "content": "You are a financial analyst expert at extracting data and performing calculations."},
                     {"role": "user", "content": calculation_prompt}
-                ],
-                temperature=0.2
+                ]
             )
 
             return json.loads(response.choices[0].message.content)
@@ -358,12 +361,11 @@ Keep your answer concise but comprehensive."""
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4.1-mini",  # Upgraded from gpt-4o-mini for better financial analysis
+                model="gpt-5-mini",  # Using GPT-5-mini for advanced financial analysis
                 messages=[
                     {"role": "system", "content": "You are an expert financial analyst providing evidence-based insights."},
                     {"role": "user", "content": answer_prompt}
-                ],
-                temperature=0.3
+                ]
             )
 
             return {
